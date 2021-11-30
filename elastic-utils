@@ -1,0 +1,593 @@
+#!/bin/bash
+
+# client_node=https://127.0.0.1
+
+curl_options="-nks"
+concurrent_recoveries=2
+in_concurrent_recoveries=2
+out_concurrent_recoveries=2
+initial_primaries_recoveries=6
+cluster_concurrent_rebalance=3
+#cluster_concurrent_rebalance=2
+allocation_enable="all"
+rebalance_enable="all"
+allow_rebalance="indices_all_active"
+recovery_bps="500mb"
+concurrent_file_chunks=null
+concurrent_operations=null
+snapshot_max_ops=null
+client_node='127.0.0.1'
+client_port='9200'
+
+
+function _allocation() {
+  echo $1
+  case $1 in
+    "primaries")
+        curl $curl_options -X PUT "$client_node:$client_port/_cluster/settings?pretty" -H 'Content-Type: application/json' -d'
+        {"transient": { "cluster.routing.allocation.enable": "primaries" } }'
+    ;;
+    "new_primaries")
+        curl $curl_options -X PUT "$client_node:$client_port/_cluster/settings?pretty" -H 'Content-Type: application/json' -d'
+        {"transient": {"cluster.routing.allocation.enable": "new_primaries"}}'
+    ;;
+    "all")
+        curl $curl_options -X PUT "$client_node:$client_port/_cluster/settings?pretty" -H 'Content-Type: application/json' -d'
+        {"transient": {"cluster.routing.allocation.enable": "all"}}'
+    ;;
+    "none")
+        curl $curl_options -X PUT "$client_node:$client_port/_cluster/settings?pretty" -H 'Content-Type: application/json' -d'
+        {"transient": {"cluster.routing.allocation.enable": "none"}}'
+    ;;
+    *)
+       printf "Options are:
+          all              - (default) Allows shard allocation for all kinds of shards.
+          primaries        - Allows shard allocation only for primary shards.
+          new_primaries    - Allows shard allocation only for primary shards for new indices.
+          none             - No shard allocation of any kind are allowed for any indices.
+
+       "
+    ;;
+  esac
+
+}
+
+function _status_allocation() {
+  echo $1
+  case $1 in
+    "primaries"|"primary")
+      curl $curl_options -s -XPOST "$client_node:$client_port/_cluster/reroute" | jq '
+      .state.routing_table.indices
+      | .[] | .shards | .[] | .[]
+      | select(.unassigned_info.reason=="PRIMARY_FAILED")'
+    ;;
+
+    "failed"|"shards-failed")
+      curl $curl_options -s -XPOST "$client_node:$client_port/_cluster/reroute" | jq '
+      .state.routing_table.indices
+      | .[] | .shards | .[] | .[]
+      | select(.unassigned_info.reason=="ALLOCATION_FAILED")'
+    ;;
+
+    "node-left"|"shards-node-left")
+      curl $curl_options -s -XPOST "$client_node:$client_port/_cluster/reroute" | jq '
+      .state.routing_table.indices
+      | .[] | .shards | .[] | .[]
+      | select(.unassigned_info.reason=="NODE_LEFT")'
+    ;;
+
+    "no-attempt"|"shards-no-attempt")
+      curl $curl_options -s -XPOST "$client_node:$client_port/_cluster/reroute" | jq '
+      .state.routing_table.indices
+      | .[] | .shards | .[] | .[]
+      | select(.unassigned_info.allocation_status=="no_attempt")'
+    ;;
+    *)
+      curl $curl_options -s "$client_node:$client_port/_cluster/allocation/explain?pretty" | jq '.index,.allocate_explanation,.unassigned_info,.node_allocation_decisions[0].deciders[0]'
+    ;;
+    "help")
+      echo 'Options are: failed | primaries | node-left | no-attempt'
+      exit 1
+    ;;
+  esac
+}
+
+function _flush() {
+    fshards=99999
+    while [  $fshards != 0 ]
+    do
+      fshards=`curl $curl_options -X POST "$client_node:$client_port/_flush?ignore_unavailable=true&pretty" | jq '._shards.failed '`
+      echo $fshards
+      sleep 5
+    done
+}
+function _index_time() {
+    timeout=$1
+    curl $curl_options -X PUT  "$client_node:$client_port/_all/_settings?pretty" -H 'Content-Type: application/json' -d"
+    {
+      \"settings\": {
+        \"index.unassigned.node_left.delayed_timeout\": \"$timeout\"
+      }
+    }"
+}
+
+function _index_refresh_interval() {
+    index_name=$1
+    interval=$2
+
+    curl $curl_options -X PUT  "$client_node:$client_port/$index_name/_settings?pretty" -H 'Content-Type: application/json' -d"
+    {
+      \"settings\": {
+        \"index.refresh_interval\": \"$interval\"
+      }
+    }"
+}
+
+function _index_rollover() {
+    index_name=$1
+    curl $curl_options -X POST  "$client_node:$client_port/$index_name/_rollover"
+}
+
+function _index_replicas() {
+    index_name=$1
+    replicas=$2
+
+    curl $curl_options -X PUT  "$client_node:$client_port/$index_name/_settings?pretty" -H 'Content-Type: application/json' -d"
+    {
+      \"settings\": {
+        \"index.number_of_replicas\": \"$replicas\"
+      }
+    }"
+}
+
+function _ilm() {
+    case $1 in
+    "status")
+      curl $curl_options "$client_node:$client_port/_ilm/status?pretty&timeout=120s&master_timeout=60s"
+    ;;
+
+    "start")
+    echo "Starting ILM"
+    STATUS="503" ;
+    while [ $STATUS == "503" ] ;
+      do
+        STATUS=`curl $curl_options -X POST "$client_node:$client_port/_ilm/start?pretty&timeout=120s&master_timeout=60s" | jq '.status'`;
+        echo $STATUS ;
+        sleep 5;
+    done
+    ;;
+
+    "stop")
+    echo "Stopping ILM"
+    STATUS="503" ;
+    while [ $STATUS == "503" ] ;
+      do
+        STATUS=`curl $curl_options -X POST "$client_node:$client_port/_ilm/stop?pretty&timeout=120s&master_timeout=60s" | jq '.status'`;
+        echo $STATUS ;
+        sleep 5;
+    done
+    ;;
+
+    *)
+      echo "Options are: status | start | stop"
+      exit 1
+    ;;
+    esac
+}
+
+function _slm() {
+    case $1 in
+    "status")
+      curl $curl_options "$client_node:$client_port/_slm/status?pretty&timeout=120s&master_timeout=60s"
+    ;;
+
+    "stats")
+      curl $curl_options "$client_node:$client_port/_slm/stats" | jq '.'
+    ;;
+
+    "start")
+    echo "Starting SLM"
+    STATUS="503" ;
+    while [ $STATUS == "503" ] ;
+      do
+        STATUS=`curl $curl_options -X POST "$client_node:$client_port/_slm/start?pretty&timeout=120s&master_timeout=60s" | jq '.status'`;
+        echo $STATUS ;
+        sleep 5;
+    done
+    ;;
+
+    "stop")
+    echo "Stopping SLM"
+    STATUS="503" ;
+    while [ $STATUS == "503" ] ;
+      do
+        STATUS=`curl $curl_options -X POST "$client_node:$client_port/_slm/stop?pretty&timeout=120s&master_timeout=60s" | jq '.status'`;
+        echo $STATUS ;
+        sleep 5;
+    done
+    ;;
+
+    *)
+      echo "Options are: status | start | stop"
+      exit 1
+    ;;
+    esac
+}
+
+function _ml () {
+
+    STATUS="503" ;
+    case $1 in
+      "start")
+    echo "Starting ML"
+        while [ $STATUS == "503" ] ;
+          do
+            STATUS=`curl $curl_options -X POST "$client_node:$client_port/_ml/set_upgrade_mode?enabled=false&timeout=10m&pretty" | jq '.status'`;
+            echo $STATUS ;
+            sleep 5;
+        done
+      ;;
+
+      "stop")
+    echo "Stopping ML"
+        while [ $STATUS == "503" ] ;
+          do
+            STATUS=`curl $curl_options -X POST "$client_node:$client_port/_ml/set_upgrade_mode?enabled=true&timeout=10m&pretty" | jq '.status'`;
+            echo $STATUS ;
+            sleep 5;
+        done
+      ;;
+      *)
+        echo "Options are: status | start | stop"
+        exit 1
+      ;;
+    esac
+}
+
+function _postup() {
+    curl $curl_options -X PUT "$client_node:$client_port/_cluster/settings?pretty" -H 'Content-Type: application/json' -d"
+    {
+      \"transient\": {
+        \"cluster.routing.allocation.enable\": \"primaries\",
+        \"cluster.routing.allocation.allow_rebalance\": \"indices_all_active\",
+        \"cluster.routing.rebalance.enable\": \"all\",
+        \"cluster.routing.allocation.node_concurrent_recoveries\": $concurrent_recoveries,
+        \"cluster.routing.allocation.node_concurrent_incoming_recoveries\": $in_concurrent_recoveries,
+        \"cluster.routing.allocation.node_concurrent_outgoing_recoveries\": $out_concurrent_recoveries,
+        \"cluster.routing.allocation.node_initial_primaries_recoveries\": $initial_primaries_recoveries
+      }
+    }"
+}
+
+function _preup() {
+    curl $curl_options -X PUT "$client_node:$client_port/_cluster/settings?pretty" -H 'Content-Type: application/json' -d'
+    {
+      "transient": {
+        "cluster.routing.allocation.allow_rebalance": "indices_all_active",
+        "cluster.routing.allocation.enable": "new_primaries",
+        "cluster.routing.rebalance.enable": "none"
+      }
+    }';
+
+    curl $curl_options -X POST "$client_node:$client_port/_ml/anomaly_detectors/_all/_close?pretty"
+    curl $curl_options -X POST "$client_node:$client_port/_ml/set_upgrade_mode?enabled=true&pretty"
+    _ilm "stop"
+    _slm "stop"
+    _index_time "10m"
+    _flush
+}
+
+function _rebalance() {
+
+  case $1 in
+    "primaries")
+        curl $curl_options -X PUT "$client_node:$client_port/_cluster/settings?pretty" -H 'Content-Type: application/json' -d'
+        {"transient": { "cluster.routing.rebalance.enable": "primaries" } }'
+    ;;
+    "replicas")
+        curl $curl_options -X PUT "$client_node:$client_port/_cluster/settings?pretty" -H 'Content-Type: application/json' -d'
+        {"transient": {"cluster.routing.rebalance.enable": "replicas"}}'
+    ;;
+    "all")
+        curl $curl_options -X PUT "$client_node:$client_port/_cluster/settings?pretty" -H 'Content-Type: application/json' -d'
+        {"transient": {"cluster.routing.rebalance.enable": "all"}}'
+    ;;
+    "none")
+        curl $curl_options -X PUT "$client_node:$client_port/_cluster/settings?pretty" -H 'Content-Type: application/json' -d'
+        {"transient": {"cluster.routing.rebalance.enable": "none"}}'
+    ;;
+    "*")
+       printf "Options are:
+          all         - (default) Allows shard balancing for all kinds of shards.
+          primaries   - Allows shard balancing only for primary shards.
+          replicas    - Allows shard balancing only for replica shards.
+          none        - No shard balancing of any kind are allowed for any indices.
+
+       "
+    ;;
+  esac
+
+}
+
+if [[ $1 == "-c" ]]
+  then
+    source $2
+    shift 2
+elif [[ $1 == "-p" ]];
+  then
+    if [[ -z $2  && -d $HOME/.elastic-utils ]];
+      then
+        ls -p $HOME/.elastic-utils | egrep -v /$
+        exit 0
+    elif [[ ! -z $2 && -d $HOME/.elastic-utils && -f $HOME/.elastic-utils/$2 ]]; then
+        source $HOME/.elastic-utils/$2
+        shift 2
+    fi
+elif [[  -d $HOME/.elastic-utils && -f $HOME/.elastic-utils/config ]];
+  then
+    source $HOME/.elastic-utils/config
+fi
+
+
+case $1 in
+  "alerts")
+    curl $curl_options -X GET "$kibana_node/api/alerts/_health" -H 'kbn-xsrf: true' | jq '.'
+  ;;
+  "allocation")
+     _allocation $2
+  ;;
+  "allocation-status")
+     _status_allocation $2
+  ;;
+  "caches")
+    curl $curl_options -s -X POST "$client_node:$client_port/_cache/clear?pretty"
+  ;;
+  "clear-transient"|"ct")
+    curl $curl_options -XPUT $client_node:$client_port/_cluster/settings?pretty  -H 'Content-Type: application/json' -d "{
+     \"transient\" :{
+       \"cluster.routing.allocation.allow_rebalance\" : null,
+       \"cluster.routing.allocation.cluster_concurrent_rebalance\" : null,
+       \"cluster.routing.allocation.enable\" : null,
+       \"cluster.routing.allocation.node_concurrent_incoming_recoveries\" : null,
+       \"cluster.routing.allocation.node_concurrent_outgoing_recoveries\" : null,
+       \"cluster.routing.allocation.node_concurrent_recoveries\" : null,
+       \"cluster.routing.allocation.node_initial_primaries_recoveries\" : null,
+       \"cluster.routing.rebalance.enable\" : null,
+       \"cluster.routing.allocation.exclude._ip\": null,
+       \"indices.recovery.max_bytes_per_sec\": null,
+       \"indices.recovery.max_concurrent_file_chunks\" : null
+     }
+   }";
+      echo
+;;
+  "concurent-recoveries"|"cr")
+    curl $curl_options -XPUT "$client_node:$client_port/_cluster/settings?timeout=90s&pretty"  -H 'Content-Type: application/json' -d "{
+\"persistent\" :{
+    \"cluster.routing.allocation.node_concurrent_recoveries\": $concurrent_recoveries,
+    \"cluster.routing.allocation.node_concurrent_incoming_recoveries\": $in_concurrent_recoveries,
+    \"cluster.routing.allocation.node_concurrent_outgoing_recoveries\": $out_concurrent_recoveries,
+    \"cluster.routing.allocation.node_initial_primaries_recoveries\": $initial_primaries_recoveries,
+    \"cluster.routing.allocation.cluster_concurrent_rebalance\": $cluster_concurrent_rebalance,
+    \"cluster.routing.allocation.allow_rebalance\": \"$allow_rebalance\",
+    \"cluster.routing.allocation.enable\": \"$allocation_enable\",
+    \"cluster.routing.rebalance.enable\": \"$rebalance_enable\",
+    \"indices.recovery.max_concurrent_file_chunks\": $concurrent_file_chunks,
+    \"snapshot.max_concurrent_operations\": $snapshot_max_ops,
+    \"indices.recovery.max_concurrent_operations\": $concurrent_operations
+  }
+}"; echo
+  ;;
+  "docs")
+    curl $curl_options -X GET "$client_node:$client_port/_cat/count?v"
+    ;;
+  "exclude")
+    curl $curl_options -H 'Content-Type: application/json' -XPUT "$client_node:$client_port/_cluster/settings?pretty" -d "{
+     \"transient\" : {
+       \"cluster.routing.allocation.exclude._ip\" : \"$2\"
+     }
+   }";echo
+  ;;
+  "flush")
+     curl $curl_options -s -X POST "$client_node:$client_port/_flush?pretty&ignore_unavailable=true" | jq "._shards"
+  ;;
+  "get-reason")
+    curl $curl_options -s "$client_node:$client_port/_cluster/state/routing_table" | jq ".routing_table.indices | .[] | .shards | .[] | .[] | select(.index == \"$2\") "
+  ;;
+  "get-recoveries"|"gr")
+    watch -d "curl $curl_options -s '$client_node:$client_port/_cat/recovery?v&active_only=true&h=index,details,shard,time,type,snode,tnode,files_percent,bytes_percent,translog_ops_percent&s=index:asc,time:desc' |egrep -v snapshot"
+  ;;
+  "get-settings-all")
+    curl $curl_options "$client_node:$client_port/_cluster/settings?include_defaults=true&flat_settings&pretty"
+  ;;
+  "get-settings")
+    curl $curl_options "$client_node:$client_port/_cluster/settings?flat_settings&pretty"
+  ;;
+  "health")
+    watch --color "curl $curl_options -s '$client_node:$client_port/_cat/health?v';"
+  ;;
+  "ilm")
+    _ilm "$2"
+  ;;
+  "index-replicas")
+    _index_replicas $2 $3
+  ;;
+  "index-time")
+    _index_time $2
+  ;;
+  "index-refresh")
+    _index_refresh_interval $2 $3
+  ;;
+  "index-rollover")
+    _index_rollover $2
+  ;;
+  "index-close")
+    curl $curl_options -XPOST "$client_node:$client_port/$2/_close";
+  ;;
+  "index-open")
+    curl $curl_options -XPOST "$client_node:$client_port/$2/_open";
+  ;;
+  "initial-recoveries"|"ir")
+    shift
+    initial_recoveries=$1
+    echo $initial_recoveries
+    curl $curl_options -XPUT "$client_node:$client_port/_cluster/settings?timeout=90s&pretty"  -H 'Content-Type: application/json' -d "{
+      \"transient\" :{
+        \"cluster.routing.allocation.node_initial_primaries_recoveries\": $initial_recoveries
+      }
+    }"; echo
+  ;;
+  "ml")
+    _ml "$2"
+  ;;
+  "nodes")
+    # curl $curl_options -s "$client_node:$client_port/_cat/nodeattrs?v&s=node:asc" | column -t;
+    curl $curl_options -s "$client_node:$client_port/_cat/nodes?v&h=ip,heap.percent,ram.percent,load_1m,load_5m,load_15m,hc,rc,ramMax,uptime,role,m,version,name&s=name:asc";
+  ;;
+  "postup")
+    _postup
+  ;;
+  "preup")
+    _preup
+  ;;
+  "rebalance")
+    _rebalance $2
+  ;;
+  "reindex-tasks")
+    watch --color -d "curl $curl_options '$client_node:$client_port/_tasks?actions=*reindex&detailed' | jq '.nodes[].tasks[] | { task_id: .id, description: .description, total:     .status.total, created:    .status.created, remaining: (.status.total - .status.created), batches: .status.batches, deleted: .status.deleted, updated: .status.updated}'"
+  ;;
+  "reloinit")
+    watch -d "curl $curl_options -s -XGET  \"$client_node:$client_port/_cat/shards?v&h=index,shard,prirep,state,node,ip&s=node:desc,index:desc\"| awk 'NR==1 || /RELOCATING/ || /INIT/'"
+    ;;
+  "retry-failed")
+    curl $curl_options -s -XPOST "$client_node:$client_port/_cluster/reroute?retry_failed=true" | jq '.acknowledged'
+  ;;
+  "slm")
+    _slm "$2"
+  ;;
+  "snapshot-recoveries"| "sr")
+    watch -d "curl $curl_options -s '$client_node:$client_port/_cat/recovery?v&active_only=true&h=index,details,shard,time,type,snode,tnode,files_percent,bytes_percent,translog_ops_percent,snapshot&s=index:asc,time:desc' |egrep -i snapshot"
+  ;;
+  "speed")
+    curl $curl_options -XPUT $client_node:$client_port/_cluster/settings?pretty  -H 'Content-Type: application/json' -d "{
+      \"transient\" : {
+        \"indices.recovery.max_bytes_per_sec\" : \"$2\"
+      },
+      \"persistent\" : {
+        \"indices.recovery.max_bytes_per_sec\" : null
+      }
+    }"; echo
+
+  ;;
+  "status")
+    watch "curl $curl_options -s '$client_node:$client_port/_cat/allocation?v&s=node:asc' ;
+           echo ;
+           curl $curl_options -s '$client_node:$client_port/_cat/health?v';
+           echo;
+           curl $curl_options -s '$client_node:$client_port/_cat/nodes?v&h=ip,heap.percent,ram.percent,load_1m,load_5m,load_15m,uptime,role,m,version,name&s=name:asc';"
+  ;;
+  "start-services")
+    _index_time "1m"
+    _ilm "start"
+    _slm "start"
+    _ml "start"
+  ;;
+  "stop-services")
+    _ilm "stop"
+    _slm "stop"
+    _ml "stop"
+  ;;
+  "unassigned"|"unass")
+    watch -d "curl $curl_options -s -XGET  \"$client_node:$client_port/_cat/shards?v&h=index,shard,prirep,state,node,ip&s=node:desc,index:desc\"| egrep 'UNASSIGNED' "
+    ;;
+  "version")
+    curl $curl_options -s r "$client_node:$client_port/_cat/nodes?h=name,ip,id,role,version&v&s=name:asc&full_id=true" | column -t
+  ;;
+  *)
+    printf "Usage:
+    $0 <command>
+
+Available commands:
+
+
+    allocation <option>                         |
+        all                                     |   (default) Allows shard allocation for all kinds of shards.
+        primaries                               |   Allows shard allocation only for primary shards.
+        new_primaries                           |   Allows shard allocation only for primary shards for new indices.
+        none                                    |   No shard allocations of any kind are allowed for any indices.
+                                                |
+    allocation-status  <option>                 |
+        failed                                  |   This will get you the shards that failed allocation
+        primaries | primary                     |   This will get you the primary shards that failed allocation
+        no-attempt                              |   This will get you the shards for which there was
+                                                |   no allocation attempt
+        node-left                               |   This will get you the shards that failed allocation
+                                                |   because a node left.
+                                                |
+    docs                                        |   Will get you the doc count
+                                                |
+    concurent-recoveries | cr                   |   Running this will increase the:
+                                                |     - concurent cluster rebalances
+                                                |     - concurent file chunks
+                                                |     - concurrent incoming and outgoing recoveries
+                                                |     - the recovery speed
+                                                |     - initial primaries recoveries
+                                                |     - Enables the allocation
+                                                |     - Enables the rebalance
+                                                |   This setting is transient.
+                                                |
+    exclude  <ip_of_node>                       |   If you need to do an upgrade a node or if you are pulling
+                                                |   a node out of the cluster for an underminate time, run this
+                                                |   and wait for the shards to get relocated to a different node.
+                                                |
+    flush                                       |   This will perform a synched flush.
+                                                |
+    get-reason <shard_name>                     |   This will get you the reason why a shard can not be
+                                                |   or is not allocated.
+                                                |
+    get-recoveries                              |   This will get you the current active recoveries
+                                                |
+    ilm                                         |
+        start                                   |   Starts ILM tasks
+        stop                                    |   Stops ILM tasks
+        status                                  |   Gives you the status of the ILM service
+                                                |
+    slm                                         |
+        start                                   |   Starts SLM tasks
+        stop                                    |   Stops SLM tasks
+        status                                  |   Gives you the SLM stats
+        status                                  |   Gives you the status of the SLM service
+                                                |
+    nodes                                       |   Will get you the nodes and node attributes
+                                                |
+    preup                                       |   Run this before doing any kind of updates that needs
+                                                |   the elasticsearch service to be restarted
+                                                |
+    postup                                      |   Run this once you are done with your restarts.
+                                                |
+    rebalance <option>                          |
+        all                                     |   (default) Allows shard balancing for all kinds of shards.
+        primaries                               |   Allows shard balancing only for primary shards.
+        replicas                                |   Allows shard balancing only for replica shards.
+        none                                    |   No shard balancing of any kind are allowed for any indices.
+                                            |
+    retry-failed                                |   This will try to reassign unassigned shards.
+                                                |
+    reindex-tasks                               |   This will get you the tasks that are currently reindexing.
+                                                |
+    reloinit                                    |   This will get you the current relocation and
+                                                |   initializing shards
+                                                |
+    speed   <desired_speed>                     |   This will readjust the recovery speed.
+                                                |
+    status                                      |   This will get you the:
+                                                |     - Allocation status
+                                                |     - Cluster health
+                                                |     - Status of the nodes
+                                                |
+    start-services                              |   Starts ML, ILM and SLM
+                                                |
+    stop-services                               |   Stops ML, ILM and SLM
+                                                |
+    version                                     |   This will get you the cluster version
+  ";;
+esac
