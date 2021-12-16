@@ -480,9 +480,9 @@ case $1 in
 
   ;;
   "status")
-    watch "curl $curl_options -s '$client_node:$client_port/_cat/allocation?v&s=node:asc' ;
+    watch "curl $curl_options -s '$client_node:$client_port/_cat/allocation?v&s=node:asc&h=shards,disk.indices,disk.used,disk.avail,disk.total,disk.percent,ip,node' ;
            echo ;
-           curl $curl_options -s '$client_node:$client_port/_cat/health?v';
+           curl $curl_options -s '$client_node:$client_port/_cat/health?v&h=ts,cluster,status,nodeTotal,nodeData,shards,pri,relo,init,unassign,pt,mtwt,active_shards_percent';
            echo;
            curl $curl_options -s '$client_node:$client_port/_cat/nodes?v&h=ip,heap.percent,ram.percent,load_1m,load_5m,load_15m,uptime,role,m,version,name&s=name:asc';"
   ;;
